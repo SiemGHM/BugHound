@@ -26,17 +26,18 @@ import sys
 
 
 API = "https://api.github.com"
-
 CLOSING_KEYWORDS = re.compile(
     r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*(?:#|https?://github\.com/[\w.-]+/[\w.-]+/issues/)(\d+)",
     re.IGNORECASE,
 )
 TEST_PATH = re.compile(r"(^|/)(tests?|testing)(/|$)|(^|/)test_[^/]*\.py$|_test\.py$|(^|/)conftest\.py$")
- 
- 
 
+
+# --------------------------------------------------------------------------- #
+# GitHub client
+# --------------------------------------------------------------------------- #
 class GitHub:
-    def __init__(self, token: str |None):
+    def __init__(self, token: str | None):
         self.s = requests.Session()
         self.s.headers.update(
             {
@@ -47,8 +48,7 @@ class GitHub:
         )
         if token:
             self.s.headers["Authorization"] = f"Bearer {token}"
- 
-        
+
     def get(self, path: str, **params) -> dict | list:
         url = path if path.startswith("http") else f"{API}{path}"
         for attempt in range(5):
@@ -69,8 +69,7 @@ class GitHub:
                 continue
             r.raise_for_status()
         raise RuntimeError(f"gave up on {url}")
-    
-    
+
     def paginate(self, path: str, limit: int, **params):
         page = 1
         seen = 0
@@ -84,9 +83,11 @@ class GitHub:
                 if seen >= limit:
                     return
             page += 1
- 
- 
- 
+
+
+# --------------------------------------------------------------------------- #
+# Case model
+# --------------------------------------------------------------------------- #
 @dataclass
 class Case:
     repo: str
@@ -98,44 +99,22 @@ class Case:
     fix_pr: int
     fix_pr_url: str
     merge_commit: str
-    base_commit: str  
-    expected_files: list[str] 
-    test_files: list[str]  
+    base_commit: str  # state of the repo before the fix -> what the agent sees
+    expected_files: list[str]  # non-test files touched by the fix
+    test_files: list[str]  # test files touched by the fix
     patch_lines: int
     notes: dict = field(default_factory=dict)
-    
-    
-def find_fixing_pr(gh: GitHub, repo: str, issue_number: int) -> dict | None:
-    """
-    Walk the issue timeline looking for a merged PR that references this issue
-    with a closing keyword. Returns the PR object or None.
-    """
-    events = gh.get(f"/repos/{repo}/issues/{issue_number}/timeline", per_page=100)
-    candidates: list[int] = []
-    for ev in events:
-        if ev.get("event") == "cross-referenced":
-            src = ev.get("source", {}).get("issue", {})
-            if src.get("pull_request") and src.get("repository", {}).get("full_name", repo) == repo:
-                candidates.append(src["number"])
-        elif ev.get("event") == "closed" and ev.get("commit_id"):
-            # Closed directly by a commit; we skip these because there's no PR
-            # to attach test files to. Could be extended later.
-            pass
- 
-    for pr_number in candidates:
-        try:
-            pr = gh.get(f"/repos/{repo}/pulls/{pr_number}")
-        except KeyError:
-            continue
-        if not pr.get("merged_at"):
-            continue
-        text = f"{pr.get('title', '')}\n{pr.get('body') or ''}"
-        referenced = {int(m) for m in CLOSING_KEYWORDS.findall(text)}
-        if issue_number in referenced:
-            return pr
-    return None
- 
- 
+
+
+# --------------------------------------------------------------------------- #
+# Mining logic
+# --------------------------------------------------------------------------- #
+def linked_issues(pr: dict) -> set[int]:
+    """Issue numbers this PR claims to close, from its title and body."""
+    text = f"{pr.get('title', '')}\n{pr.get('body') or ''}"
+    return {int(m) for m in CLOSING_KEYWORDS.findall(text)}
+
+
 def classify_files(files: list[dict]) -> tuple[list[str], list[str], int]:
     src, tests, lines = [], [], 0
     for f in files:
@@ -147,8 +126,8 @@ def classify_files(files: list[dict]) -> tuple[list[str], list[str], int]:
             src.append(path)
         # non-code files (docs, changelog) are ignored for ground truth
     return src, tests, lines
- 
- 
+
+
 def mine(
     repo: str,
     max_cases: int,
@@ -162,28 +141,39 @@ def mine(
     gh = GitHub(token)
     cases: list[Case] = []
     scanned = 0
- 
-    params = {"state": "closed", "sort": "updated", "direction": "desc"}
-    if labels:
-        params["labels"] = ",".join(labels)
- 
-    for issue in gh.paginate(f"/repos/{repo}/issues", limit=scan_limit, **params):
+
+    seen_issues: set[int] = set()
+
+    # Walk merged PRs (newest first) and follow their "fixes #N" links to issues.
+    # This is the direction the link is actually written in, so it's far more
+    # reliable than reconstructing it from an issue's timeline events.
+    for pr in gh.paginate(f"/repos/{repo}/pulls", limit=scan_limit, state="closed", sort="updated", direction="desc"):
         if len(cases) >= max_cases:
             break
-        if "pull_request" in issue:  # the issues endpoint also returns PRs
+        if not pr.get("merged_at"):
             continue
         scanned += 1
-        n = issue["number"]
-        print(f"[{scanned}] issue #{n}: {issue['title'][:60]}", file=sys.stderr)
- 
-        pr = find_fixing_pr(gh, repo, n)
-        if not pr:
-            print("    no merged PR with closing keyword", file=sys.stderr)
+        issues = linked_issues(pr) - seen_issues
+        if not issues:
             continue
- 
+
+        # One PR usually fixes one issue; if it claims several, take the first
+        # and treat the rest as seen so we don't double-count the same fix.
+        n = min(issues)
+        seen_issues |= issues
+        try:
+            issue = gh.get(f"/repos/{repo}/issues/{n}")
+        except KeyError:
+            continue
+        if "pull_request" in issue:  # the number pointed at a PR, not an issue
+            continue
+        if labels and not ({l["name"] for l in issue.get("labels", [])} & set(labels)):
+            continue
+        print(f"[{scanned}] PR #{pr['number']} -> issue #{n}: {issue['title'][:60]}", file=sys.stderr)
+
         files = gh.get(f"/repos/{repo}/pulls/{pr['number']}/files", per_page=100)
         src, tests, lines = classify_files(files)
- 
+
         if not (1 <= len(src) <= max_src_files):
             print(f"    skip: {len(src)} source files", file=sys.stderr)
             continue
@@ -193,14 +183,14 @@ def mine(
         if lines > max_patch_lines:
             print(f"    skip: patch too large ({lines} lines)", file=sys.stderr)
             continue
- 
+
         merge_sha = pr["merge_commit_sha"]
         commit = gh.get(f"/repos/{repo}/commits/{merge_sha}")
         parents = commit.get("parents", [])
         if not parents:
             continue
         base_sha = parents[0]["sha"]
- 
+
         case = Case(
             repo=repo,
             issue_number=n,
@@ -218,28 +208,31 @@ def mine(
             notes={"merged_at": pr["merged_at"], "pr_title": pr["title"]},
         )
         cases.append(case)
-        print(f"    ✓ case {len(cases)}: PR #{pr['number']} -> {src}", file=sys.stderr)
- 
-    print(f"\nscanned {scanned} issues, kept {len(cases)} cases", file=sys.stderr)
+        print(f"    ✓ case {len(cases)}: {src}", file=sys.stderr)
+
+    print(f"\nscanned {scanned} merged PRs, kept {len(cases)} cases", file=sys.stderr)
     return cases
- 
- 
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("repo", help="owner/name")
     ap.add_argument("--out", default="benchmark/cases.jsonl")
     ap.add_argument("--max-cases", type=int, default=50)
-    ap.add_argument("--scan-limit", type=int, default=400, help="max closed issues to inspect")
-    ap.add_argument("--label", action="append", default=[], help="filter by label (repeatable), e.g. --label bug")
+    ap.add_argument("--scan-limit", type=int, default=400, help="max closed PRs to inspect")
+    ap.add_argument("--label", action="append", default=[], help="keep only issues with this label (repeatable)")
     ap.add_argument("--max-src-files", type=int, default=2)
     ap.add_argument("--max-patch-lines", type=int, default=200)
     ap.add_argument("--no-require-tests", action="store_true", help="keep cases whose fix touched no test file")
     args = ap.parse_args()
- 
+
     token = os.environ.get("GITHUB_TOKEN")
     if not token:
         print("warning: no GITHUB_TOKEN set; unauthenticated limit is 60 req/hr", file=sys.stderr)
- 
+
     cases = mine(
         repo=args.repo,
         max_cases=args.max_cases,
@@ -250,14 +243,14 @@ def main() -> None:
         require_tests=not args.no_require_tests,
         token=token,
     )
- 
+
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w") as f:
         for c in cases:
             f.write(json.dumps(asdict(c)) + "\n")
     print(f"wrote {len(cases)} cases to {out}", file=sys.stderr)
- 
- 
+
+
 if __name__ == "__main__":
     main()

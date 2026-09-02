@@ -6,7 +6,7 @@ Run:  pytest test_mine_benchmark.py -v
 
 import pytest
 
-from mine_benchmark import CLOSING_KEYWORDS, TEST_PATH, Fix, classify_files, find_fix, fix_files
+from mine_benchmark import CLOSING_KEYWORDS, TEST_PATH, classify_files, linked_issues
 
 
 # ----------------------------------------------------------------- regexes --
@@ -67,100 +67,11 @@ def test_classify_files_handles_missing_counts():
     assert src == ["a.py"] and tests == [] and lines == 0
 
 
-# ---------------------------------------------------------------- find_fix --
-class FakeGitHub:
-    """Minimal stand-in for GitHub client: serves canned responses by path."""
-
-    def __init__(self, responses: dict):
-        self.responses = responses
-        self.calls = []
-
-    def get(self, path, **params):
-        self.calls.append(path)
-        if path not in self.responses:
-            raise KeyError(path)
-        return self.responses[path]
+# ----------------------------------------------------------- linked_issues --
+def test_linked_issues_from_body_and_title():
+    pr = {"title": "Fix decimal schema (closes #12)", "body": "Also fixes #34.\nSee #56 for context."}
+    assert linked_issues(pr) == {12, 34}
 
 
-def _xref(n, repo="o/r"):
-    return {
-        "event": "cross-referenced",
-        "source": {"issue": {"number": n, "pull_request": {"url": f"x/{n}"}, "repository": {"full_name": repo}}},
-    }
-
-
-def _closed_by(sha):
-    return {"event": "closed", "commit_id": sha}
-
-
-def _pr(n, body, merged_at="2026-01-01T00:00:00Z"):
-    return {"number": n, "merged_at": merged_at, "body": body, "title": f"PR {n}",
-            "html_url": f"https://github.com/o/r/pull/{n}", "merge_commit_sha": f"merge{n}"}
-
-
-ISSUE = {"number": 10, "closed_at": "2026-01-01T12:00:00Z"}
-
-
-def test_closing_keyword_wins():
-    gh = FakeGitHub({
-        "/repos/o/r/issues/10/timeline": [_xref(20), _xref(21)],
-        "/repos/o/r/pulls/20": _pr(20, "Fixes #10", merged_at=None),  # not merged
-        "/repos/o/r/pulls/21": _pr(21, "Closes #10"),
-    })
-    fix = find_fix(gh, "o/r", ISSUE)
-    assert fix.number == 21 and fix.evidence == "closing-keyword" and fix.sha == "merge21"
-
-
-def test_closed_by_commit_uses_its_pr():
-    gh = FakeGitHub({
-        "/repos/o/r/issues/10/timeline": [_closed_by("abc123")],
-        "/repos/o/r/commits/abc123/pulls": [_pr(40, "no keyword here")],
-    })
-    fix = find_fix(gh, "o/r", ISSUE)
-    assert fix.kind == "pr" and fix.number == 40 and fix.evidence == "close-commit"
-
-
-def test_closed_by_bare_commit():
-    gh = FakeGitHub({
-        "/repos/o/r/issues/10/timeline": [_closed_by("abc123")],
-        "/repos/o/r/commits/abc123/pulls": [],
-        "/repos/o/r/commits/abc123": {
-            "html_url": "https://github.com/o/r/commit/abc123",
-            "commit": {"message": "Fix the thing\n\nlong body", "committer": {"date": "2026-01-01T00:00:00Z"}},
-        },
-    })
-    fix = find_fix(gh, "o/r", ISSUE)
-    assert fix.kind == "commit" and fix.number is None and fix.sha == "abc123" and fix.title == "Fix the thing"
-
-
-def test_merge_proximity_fallback():
-    gh = FakeGitHub({
-        "/repos/o/r/issues/10/timeline": [_xref(30)],
-        "/repos/o/r/pulls/30": _pr(30, "Related to #10", merged_at="2026-01-02T00:00:00Z"),  # 12h after close
-    })
-    fix = find_fix(gh, "o/r", ISSUE)
-    assert fix.number == 30 and fix.evidence == "merge-proximity"
-
-
-def test_distant_mention_is_not_a_fix():
-    gh = FakeGitHub({
-        "/repos/o/r/issues/10/timeline": [_xref(30)],
-        "/repos/o/r/pulls/30": _pr(30, "Related to #10", merged_at="2025-06-01T00:00:00Z"),  # months earlier
-    })
-    assert find_fix(gh, "o/r", ISSUE) is None
-
-
-def test_deleted_pr_is_skipped():
-    gh = FakeGitHub({"/repos/o/r/issues/10/timeline": [_xref(99)]})  # /pulls/99 -> 404
-    assert find_fix(gh, "o/r", ISSUE) is None
-
-
-def test_fix_files_dispatches_on_kind():
-    gh = FakeGitHub({
-        "/repos/o/r/pulls/5/files": [{"filename": "a.py"}],
-        "/repos/o/r/commits/sha1": {"files": [{"filename": "b.py"}]},
-    })
-    pr_fix = Fix("pr", "m", "u", "t", 5, None, "e")
-    commit_fix = Fix("commit", "sha1", "u", "t", None, None, "e")
-    assert fix_files(gh, "o/r", pr_fix) == [{"filename": "a.py"}]
-    assert fix_files(gh, "o/r", commit_fix) == [{"filename": "b.py"}]
+def test_linked_issues_handles_missing_body():
+    assert linked_issues({"title": "chore", "body": None}) == set()
