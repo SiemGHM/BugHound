@@ -14,7 +14,8 @@
 ## Roadmap
 
 - [ ] Week 1 — sandbox + tools + loop working end-to-end on one hand-picked issue
-- [ ] Week 2 — benchmark dataset mined from GitHub issues and eval script ready
+- [x] Week 2 — benchmark dataset mined from GitHub issues 
+- [ ] Week 2(b) - Get eval Script ready
 - [ ] Week 3 — iterate on prompts, tool design, and budgets against the benchmark
 - [ ] Week 4 — trace viewer, prompt caching, multi-model comparison
 - [ ] Week 5 — deploy demo, write up results and failure modes
